@@ -13,207 +13,176 @@
 
 import uuid
 
+import fixtures
 import mock
-from testtools import matchers
 import webob
 
-from keystonemiddleware import audit
 from keystonemiddleware.tests.unit.audit import base
 
 
-@mock.patch('oslo_messaging.get_transport', mock.MagicMock())
 class AuditMiddlewareTest(base.BaseAuditMiddlewareTest):
 
-    def test_api_request(self):
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        with mock.patch('oslo_messaging.Notifier.info') as notify:
-            self.middleware(req)
-            # Check first notification with only 'request'
-            call_args = notify.call_args_list[0][0]
-            self.assertEqual('audit.http.request', call_args[1])
-            self.assertEqual('/foo/bar', call_args[2]['requestPath'])
-            self.assertEqual('pending', call_args[2]['outcome'])
-            self.assertNotIn('reason', call_args[2])
-            self.assertNotIn('reporterchain', call_args[2])
+    def setUp(self):
+        self.notifier = mock.MagicMock()
 
-            # Check second notification with request + response
-            call_args = notify.call_args_list[1][0]
-            self.assertEqual('audit.http.response', call_args[1])
-            self.assertEqual('/foo/bar', call_args[2]['requestPath'])
-            self.assertEqual('success', call_args[2]['outcome'])
-            self.assertIn('reason', call_args[2])
-            self.assertIn('reporterchain', call_args[2])
+        p = 'keystonemiddleware.audit._notifier.create_notifier'
+        f = fixtures.MockPatch(p, return_value=self.notifier)
+        self.notifier_fixture = self.useFixture(f)
+
+        super(AuditMiddlewareTest, self).setUp()
+
+    def test_api_request(self):
+        self.create_simple_app().get('/foo/bar',
+                                     extra_environ=self.get_environ_header())
+
+        # Check first notification with only 'request'
+        call_args = self.notifier.notify.call_args_list[0][0]
+        self.assertEqual('audit.http.request', call_args[1])
+        self.assertEqual('/foo/bar', call_args[2]['requestPath'])
+        self.assertEqual('pending', call_args[2]['outcome'])
+        self.assertNotIn('reason', call_args[2])
+        self.assertNotIn('reporterchain', call_args[2])
+
+        # Check second notification with request + response
+        call_args = self.notifier.notify.call_args_list[1][0]
+        self.assertEqual('audit.http.response', call_args[1])
+        self.assertEqual('/foo/bar', call_args[2]['requestPath'])
+        self.assertEqual('success', call_args[2]['outcome'])
+        self.assertIn('reason', call_args[2])
+        self.assertIn('reporterchain', call_args[2])
 
     def test_api_request_failure(self):
-        self.middleware = audit.AuditMiddleware(
-            base.FakeFailingApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        with mock.patch('oslo_messaging.Notifier.info') as notify:
-            try:
-                self.middleware(req)
-                self.fail('Application exception has not been re-raised')
-            except Exception:
-                pass
-            # Check first notification with only 'request'
-            call_args = notify.call_args_list[0][0]
-            self.assertEqual('audit.http.request', call_args[1])
-            self.assertEqual('/foo/bar', call_args[2]['requestPath'])
-            self.assertEqual('pending', call_args[2]['outcome'])
-            self.assertNotIn('reporterchain', call_args[2])
 
-            # Check second notification with request + response
-            call_args = notify.call_args_list[1][0]
-            self.assertEqual('audit.http.response', call_args[1])
-            self.assertEqual('/foo/bar', call_args[2]['requestPath'])
-            self.assertEqual('unknown', call_args[2]['outcome'])
-            self.assertIn('reporterchain', call_args[2])
+        class CustomException(Exception):
+            pass
+
+        def cb(req):
+            raise CustomException('It happens!')
+
+        try:
+            self.create_app(cb).get('/foo/bar',
+                                    extra_environ=self.get_environ_header())
+
+            self.fail('Application exception has not been re-raised')
+        except CustomException:
+            pass
+
+        # Check first notification with only 'request'
+        call_args = self.notifier.notify.call_args_list[0][0]
+        self.assertEqual('audit.http.request', call_args[1])
+        self.assertEqual('/foo/bar', call_args[2]['requestPath'])
+        self.assertEqual('pending', call_args[2]['outcome'])
+        self.assertNotIn('reporterchain', call_args[2])
+
+        # Check second notification with request + response
+        call_args = self.notifier.notify.call_args_list[1][0]
+        self.assertEqual('audit.http.response', call_args[1])
+        self.assertEqual('/foo/bar', call_args[2]['requestPath'])
+        self.assertEqual('unknown', call_args[2]['outcome'])
+        self.assertIn('reporterchain', call_args[2])
 
     def test_process_request_fail(self):
         req = webob.Request.blank('/foo/bar',
                                   environ=self.get_environ_header('GET'))
         req.context = {}
-        with mock.patch('oslo_messaging.Notifier.info',
-                        side_effect=Exception('error')) as notify:
-            self.middleware._process_request(req)
-            self.assertTrue(notify.called)
+
+        self.create_simple_middleware()._process_request(req)
+        self.assertTrue(self.notifier.notify.called)
 
     def test_process_response_fail(self):
         req = webob.Request.blank('/foo/bar',
                                   environ=self.get_environ_header('GET'))
         req.context = {}
-        with mock.patch('oslo_messaging.Notifier.info',
-                        side_effect=Exception('error')) as notify:
-            self.middleware._process_response(req, webob.response.Response())
-            self.assertTrue(notify.called)
+
+        middleware = self.create_simple_middleware()
+        middleware._process_response(req, webob.response.Response())
+        self.assertTrue(self.notifier.notify.called)
 
     def test_ignore_req_opt(self):
-        self.middleware = audit.AuditMiddleware(base.FakeApp(),
-                                                audit_map_file=self.audit_map,
-                                                ignore_req_list='get, PUT')
-        req = webob.Request.blank('/skip/foo',
-                                  environ=self.get_environ_header('GET'))
-        req1 = webob.Request.blank('/skip/foo',
-                                   environ=self.get_environ_header('PUT'))
-        req2 = webob.Request.blank('/accept/foo',
-                                   environ=self.get_environ_header('POST'))
-        with mock.patch('oslo_messaging.Notifier.info') as notify:
-            # Check GET/PUT request does not send notification
-            self.middleware(req)
-            self.middleware(req1)
-            self.assertEqual([], notify.call_args_list)
+        app = self.create_simple_app(ignore_req_list='get, PUT')
 
-            # Check non-GET/PUT request does send notification
-            self.middleware(req2)
-            self.assertThat(notify.call_args_list, matchers.HasLength(2))
-            call_args = notify.call_args_list[0][0]
-            self.assertEqual('audit.http.request', call_args[1])
-            self.assertEqual('/accept/foo', call_args[2]['requestPath'])
+        # Check GET/PUT request does not send notification
+        app.get('/skip/foo', extra_environ=self.get_environ_header())
+        app.put('/skip/foo', extra_environ=self.get_environ_header())
 
-            call_args = notify.call_args_list[1][0]
-            self.assertEqual('audit.http.response', call_args[1])
-            self.assertEqual('/accept/foo', call_args[2]['requestPath'])
+        self.assertFalse(self.notifier.notify.called)
 
-    def test_api_request_no_messaging(self):
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        with mock.patch('keystonemiddleware.audit._notifier.oslo_messaging',
-                        None):
-            with mock.patch('keystonemiddleware.audit._LOG.info') as log:
-                self.middleware = audit.AuditMiddleware(
-                    base.FakeApp(),
-                    audit_map_file=self.audit_map)
+        # Check non-GET/PUT request does send notification
+        app.post('/accept/foo', extra_environ=self.get_environ_header())
 
-                self.middleware(req)
-                # Check first notification with only 'request'
-                call_args = log.call_args_list[0][0]
-                self.assertEqual('audit.http.request',
-                                 call_args[1]['event_type'])
+        self.assertEqual(2, self.notifier.notify.call_count)
 
-                # Check second notification with request + response
-                call_args = log.call_args_list[1][0]
-                self.assertEqual('audit.http.response',
-                                 call_args[1]['event_type'])
+        call_args = self.notifier.notify.call_args_list[0][0]
+        self.assertEqual('audit.http.request', call_args[1])
+        self.assertEqual('/accept/foo', call_args[2]['requestPath'])
+
+        call_args = self.notifier.notify.call_args_list[1][0]
+        self.assertEqual('audit.http.response', call_args[1])
+        self.assertEqual('/accept/foo', call_args[2]['requestPath'])
 
     def test_cadf_event_context_scoped(self):
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        with mock.patch('oslo_messaging.Notifier.info') as notify:
-            middleware(req)
+        self.create_simple_app().get('/foo/bar',
+                                     extra_environ=self.get_environ_header())
 
-            self.assertEqual(2, notify.call_count)
-            first, second = [a[0] for a in notify.call_args_list]
+        self.assertEqual(2, self.notifier.notify.call_count)
+        first, second = [a[0] for a in self.notifier.notify.call_args_list]
 
-            # the Context is the first argument. Let's verify it.
-            self.assertIsInstance(first[0], dict)
+        # the Context is the first argument. Let's verify it.
+        self.assertIsInstance(first[0], dict)
 
-            # ensure exact same context is used between request and response
-            self.assertIs(first[0], second[0])
+        # ensure exact same context is used between request and response
+        self.assertIs(first[0], second[0])
 
     def test_cadf_event_scoped_to_request(self):
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        with mock.patch('oslo_messaging.Notifier.info') as notify:
-            middleware(req)
-            self.assertIsNotNone(req.environ.get('cadf_event'))
+        app = self.create_simple_app()
+        resp = app.get('/foo/bar', extra_environ=self.get_environ_header())
+        self.assertIsNotNone(resp.request.environ.get('cadf_event'))
 
-            # ensure exact same event is used between request and response
-            self.assertEqual(notify.call_args_list[0][0][2]['id'],
-                             notify.call_args_list[1][0][2]['id'])
+        # ensure exact same event is used between request and response
+        self.assertEqual(self.notifier.calls[0].payload['id'],
+                         self.notifier.calls[1].payload['id'])
 
     def test_cadf_event_scoped_to_request_on_error(self):
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
+        middleware = self.create_simple_middleware()
+
         req = webob.Request.blank('/foo/bar',
                                   environ=self.get_environ_header('GET'))
         req.context = {}
-        with mock.patch('oslo_messaging.Notifier.info',
-                        side_effect=Exception('error')) as notify:
-            middleware._process_request(req)
-            self.assertTrue(notify.called)
+        self.notifier.notify.side_effect = Exception('error')
+
+        middleware(req)
+        self.assertTrue(self.notifier.notify.called)
+
         req2 = webob.Request.blank('/foo/bar',
                                    environ=self.get_environ_header('GET'))
         req2.context = {}
-        with mock.patch('oslo_messaging.Notifier.info') as notify:
-            middleware._process_response(req2, webob.response.Response())
-            self.assertTrue(notify.called)
-            # ensure event is not the same across requests
-            self.assertNotEqual(req.environ['cadf_event'].id,
-                                notify.call_args_list[0][0][2]['id'])
+        self.notifier.reset_mock()
+
+        middleware._process_response(req2, webob.response.Response())
+        self.assertTrue(self.notifier.notify.called)
+        # ensure event is not the same across requests
+        self.assertNotEqual(req.environ['cadf_event'].id,
+                            self.notifier.notify.call_args_list[0][0][2]['id'])
 
     def test_project_name_from_oslo_config(self):
         self.assertEqual(self.PROJECT_NAME,
-                         self.middleware._conf.project)
+                         self.create_simple_middleware()._conf.project)
 
     def test_project_name_from_local_config(self):
         project_name = uuid.uuid4().hex
-        self.middleware = audit.AuditMiddleware(
-            base.FakeApp(), audit_map_file=self.audit_map,
-            service_name='pycadf', project=project_name)
-        self.assertEqual(project_name, self.middleware._conf.project)
+        middleware = self.create_simple_middleware(project=project_name)
+        self.assertEqual(project_name, middleware._conf.project)
 
     def test_no_response(self):
+        middleware = self.create_simple_middleware()
         url = 'http://admin_host:8774/v2/' + str(uuid.uuid4()) + '/servers'
         req = webob.Request.blank(url,
                                   environ=self.get_environ_header('GET'),
                                   remote_addr='192.168.0.1')
         req.context = {}
-        self.middleware._process_request(req)
+        middleware._process_request(req)
         payload = req.environ['cadf_event'].as_dict()
-        self.middleware._process_response(req, None)
+        middleware._process_response(req, None)
         payload2 = req.environ['cadf_event'].as_dict()
         self.assertEqual(payload['id'], payload2['id'])
         self.assertEqual(payload['tags'], payload2['tags'])
@@ -230,110 +199,12 @@ class AuditMiddlewareTest(base.BaseAuditMiddlewareTest):
                                   environ=self.get_environ_header('GET'))
         req.context = {}
         self.assertNotIn('cadf_event', req.environ)
-        self.middleware._process_response(req, webob.Response())
+
+        self.create_simple_middleware()._process_response(req,
+                                                          webob.Response())
         self.assertIn('cadf_event', req.environ)
         payload = req.environ['cadf_event'].as_dict()
         self.assertEqual(payload['outcome'], 'success')
         self.assertEqual(payload['reason']['reasonType'], 'HTTP')
         self.assertEqual(payload['reason']['reasonCode'], '200')
         self.assertEqual(payload['observer']['id'], 'target')
-
-
-def _get_transport(conf, aliases=None, url=None):
-    transport = mock.MagicMock()
-    transport.conf = conf
-    conf.register_opts = mock.MagicMock()
-    return transport
-
-
-@mock.patch('oslo_messaging.get_transport', side_effect=_get_transport)
-class AuditNotifierConfigTest(base.BaseAuditMiddlewareTest):
-
-    def test_conf_middleware_log_and_default_as_messaging(self, t):
-        self.cfg.config(driver='log', group='audit_middleware_notifications')
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        req.context = {}
-        with mock.patch('oslo_messaging.notify._impl_log.LogDriver.notify',
-                        side_effect=Exception('error')) as driver:
-            middleware._process_request(req)
-            # audit middleware conf has 'log' make sure that driver is invoked
-            # and not the one specified in DEFAULT section
-            self.assertTrue(driver.called)
-
-    def test_conf_middleware_log_and_oslo_msg_as_messaging(self, t):
-        self.cfg.config(driver='messaging',
-                        group='oslo_messaging_notifications')
-        self.cfg.config(driver='log',
-                        group='audit_middleware_notifications')
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        req.context = {}
-        with mock.patch('oslo_messaging.notify._impl_log.LogDriver.notify',
-                        side_effect=Exception('error')) as driver:
-            middleware._process_request(req)
-            # audit middleware conf has 'log' make sure that driver is invoked
-            # and not the one specified in oslo_messaging_notifications section
-            self.assertTrue(driver.called)
-
-    def test_conf_middleware_messaging_and_oslo_msg_as_log(self, t):
-        self.cfg.config(driver='log', group='oslo_messaging_notifications')
-        self.cfg.config(driver='messaging',
-                        group='audit_middleware_notifications')
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        req.context = {}
-        with mock.patch('oslo_messaging.notify.messaging.MessagingDriver'
-                        '.notify',
-                        side_effect=Exception('error')) as driver:
-            # audit middleware has 'messaging' make sure that driver is invoked
-            # and not the one specified in oslo_messaging_notifications section
-            middleware._process_request(req)
-            self.assertTrue(driver.called)
-
-    def test_with_no_middleware_notification_conf(self, t):
-        self.cfg.config(driver='messaging',
-                        group='oslo_messaging_notifications')
-        self.cfg.config(driver=None, group='audit_middleware_notifications')
-
-        middleware = audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        req = webob.Request.blank('/foo/bar',
-                                  environ=self.get_environ_header('GET'))
-        req.context = {}
-        with mock.patch('oslo_messaging.notify.messaging.MessagingDriver'
-                        '.notify',
-                        side_effect=Exception('error')) as driver:
-            # audit middleware section is not set. So driver needs to be
-            # invoked from oslo_messaging_notifications section.
-            middleware._process_request(req)
-            self.assertTrue(driver.called)
-
-    def test_conf_middleware_messaging_and_transport_set(self, mock_transport):
-        transport_url = 'rabbit://me:passwd@host:5672/virtual_host'
-        self.cfg.config(driver='messaging',
-                        transport_url=transport_url,
-                        group='audit_middleware_notifications')
-
-        audit.AuditMiddleware(
-            base.FakeApp(),
-            audit_map_file=self.audit_map,
-            service_name='pycadf')
-        self.assertTrue(mock_transport.called)
-        # make sure first call kwarg 'url' is same as provided transport_url
-        self.assertEqual(transport_url,
-                         mock_transport.call_args_list[0][1]['url'])

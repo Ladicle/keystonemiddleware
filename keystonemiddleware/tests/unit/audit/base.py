@@ -12,7 +12,9 @@
 
 
 from oslo_config import fixture as cfg_fixture
+from oslo_messaging import conffixture as msg_fixture
 from oslotest import createfile
+import webob.dec
 
 from keystonemiddleware import audit
 from keystonemiddleware.tests.unit import utils
@@ -35,22 +37,7 @@ compute = service/compute
 """
 
 
-class FakeApp(object):
-    def __call__(self, env, start_response):
-        body = 'Some response'
-        start_response('200 OK', [
-            ('Content-Type', 'text/plain'),
-            ('Content-Length', str(sum(map(len, body))))
-        ])
-        return [body]
-
-
-class FakeFailingApp(object):
-    def __call__(self, env, start_response):
-        raise Exception('It happens!')
-
-
-class BaseAuditMiddlewareTest(utils.BaseTestCase):
+class BaseAuditMiddlewareTest(utils.MiddlewareTestCase):
     PROJECT_NAME = 'keystonemiddleware'
 
     def setUp(self):
@@ -60,18 +47,27 @@ class BaseAuditMiddlewareTest(utils.BaseTestCase):
             createfile.CreateFileWithContent('audit', audit_map_content))
 
         self.cfg = self.useFixture(cfg_fixture.Config())
+        self.msg = self.useFixture(msg_fixture.ConfFixture(self.cfg.conf))
+
         self.cfg.conf([], project=self.PROJECT_NAME)
 
-        self.middleware = audit.AuditMiddleware(
-            FakeApp(), audit_map_file=self.audit_map,
-            service_name='pycadf')
+    def create_middleware(self, cb, **kwargs):
+
+        @webob.dec.wsgify
+        def _do_cb(req):
+            return cb(req)
+
+        kwargs.setdefault('audit_map_file', self.audit_map)
+        kwargs.setdefault('service_name', 'pycadf')
+
+        return audit.AuditMiddleware(_do_cb, **kwargs)
 
     @property
     def audit_map(self):
         return self.audit_map_file_fixture.path
 
     @staticmethod
-    def get_environ_header(req_type):
+    def get_environ_header(req_type=None):
         env_headers = {'HTTP_X_SERVICE_CATALOG':
                        '''[{"endpoints_links": [],
                             "endpoints": [{"adminURL":
@@ -89,5 +85,6 @@ class BaseAuditMiddlewareTest(utils.BaseTestCase):
                        'HTTP_X_AUTH_TOKEN': 'token',
                        'HTTP_X_PROJECT_ID': 'tenant_id',
                        'HTTP_X_IDENTITY_STATUS': 'Confirmed'}
-        env_headers['REQUEST_METHOD'] = req_type
+        if req_type:
+            env_headers['REQUEST_METHOD'] = req_type
         return env_headers

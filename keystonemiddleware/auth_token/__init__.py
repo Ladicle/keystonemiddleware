@@ -216,6 +216,7 @@ import binascii
 import copy
 import datetime
 import logging
+import warnings
 
 from keystoneauth1 import access
 from keystoneauth1 import adapter
@@ -306,6 +307,14 @@ class BaseAuthProtocol(object):
                                    perform.
     """
 
+    # NOTE(jamielennox): Default to True and remove in Pike.
+    kwargs_to_fetch_token = False
+    """A compatibility flag to allow passing **kwargs to fetch_token().
+
+    This is basically to allow compatibility with keystone's override. We will
+    assume all subclasses are ok with this being True in the Pike release.
+    """
+
     def __init__(self,
                  app,
                  log=_LOG,
@@ -383,9 +392,16 @@ class BaseAuthProtocol(object):
         if auth_ref.will_expire_soon(stale_duration=0):
             raise ksm_exceptions.InvalidToken(_('Token authorization failed'))
 
-    def _do_fetch_token(self, token):
+    def _do_fetch_token(self, token, **kwargs):
         """Helper method to fetch a token and convert it into an AccessInfo."""
-        data = self.fetch_token(token)
+        if self.kwargs_to_fetch_token:
+            data = self.fetch_token(token, **kwargs)
+        else:
+            m = _('Implementations of auth_token must set '
+                  'kwargs_to_fetch_token this will be the required and '
+                  'assumed in Pike.')
+            warnings.warn(m)
+            data = self.fetch_token(token)
 
         try:
             return data, access.create(body=data, auth_token=token)
@@ -393,7 +409,7 @@ class BaseAuthProtocol(object):
             self.log.warning(_LW('Invalid token contents.'), exc_info=True)
             raise ksm_exceptions.InvalidToken(_('Token authorization failed'))
 
-    def fetch_token(self, token):
+    def fetch_token(self, token, **kwargs):
         """Fetch the token data based on the value in the header.
 
         Retrieve the data associated with the token value that was in the
@@ -401,13 +417,17 @@ class BaseAuthProtocol(object):
         whatever is required.
 
         :param str token: The token present in the request header.
+        :param dict kwargs: Additional keyword arguments may be passed through
+                            here to support new features. If an implementation
+                            is not aware of how to use these arguments it
+                            should ignore them.
 
         :raises exc.InvalidToken: if token is invalid.
 
         :returns: The token data
         :rtype: dict
         """
-        raise NotImplemented()
+        raise NotImplementedError()
 
     def process_response(self, response):
         """Do whatever you'd like to the response.
@@ -487,6 +507,8 @@ class AuthProtocol(BaseAuthProtocol):
     _SIGNING_CERT_FILE_NAME = 'signing_cert.pem'
     _SIGNING_CA_FILE_NAME = 'cacert.pem'
 
+    kwargs_to_fetch_token = True
+
     def __init__(self, app, conf):
         log = logging.getLogger(conf.get('log_name', __name__))
         log.info(_LI('Starting Keystone auth_token middleware'))
@@ -508,6 +530,8 @@ class AuthProtocol(BaseAuthProtocol):
             'include_service_catalog')
         self._hash_algorithms = self._conf.get('hash_algorithms')
 
+        self._auth = self._create_auth_plugin()
+        self._session = self._create_session()
         self._identity_server = self._create_identity_server()
 
         self._auth_uri = self._conf.get('auth_uri')
@@ -570,7 +594,8 @@ class AuthProtocol(BaseAuthProtocol):
                 self.log.info(_LI('Deferring reject downstream'))
             else:
                 self.log.info(_LI('Rejecting request'))
-                message = 'The request you have made requires authentication.'
+                message = _('The request you have made requires '
+                            'authentication.')
                 body = {'error': {
                     'code': 401,
                     'title': 'Unauthorized',
@@ -582,14 +607,17 @@ class AuthProtocol(BaseAuthProtocol):
                     content_type='application/json')
 
         if request.user_token_valid:
-            user_auth_ref = request.token_auth._user_auth_ref
-            request.set_user_headers(user_auth_ref)
+            request.set_user_headers(request.token_auth.user)
 
             if self._include_service_catalog:
-                request.set_service_catalog_headers(user_auth_ref)
+                request.set_service_catalog_headers(request.token_auth.user)
+
+        if request.token_auth:
+            request.token_auth._auth = self._auth
+            request.token_auth._session = self._session
 
         if request.service_token and request.service_token_valid:
-            request.set_service_headers(request.token_auth._serv_auth_ref)
+            request.set_service_headers(request.token_auth.service)
 
         if self.log.isEnabledFor(logging.DEBUG):
             self.log.debug('Received request from %s',
@@ -791,7 +819,7 @@ class AuthProtocol(BaseAuthProtocol):
             self._SIGNING_CA_FILE_NAME,
             self._identity_server.fetch_ca_cert())
 
-    def _get_auth_plugin(self):
+    def _create_auth_plugin(self):
         # NOTE(jamielennox): Ideally this would use load_from_conf_options
         # however that is not possible because we have to support the override
         # pattern we use in _conf.get. This function therefore does a manual
@@ -830,25 +858,24 @@ class AuthProtocol(BaseAuthProtocol):
         getter = lambda opt: self._conf.get(opt.dest, group=group)
         return plugin_loader.load_from_options_getter(getter)
 
-    def _create_identity_server(self):
+    def _create_session(self, **kwargs):
         # NOTE(jamielennox): Loading Session here should be exactly the
         # same as calling Session.load_from_conf_options(CONF, GROUP)
         # however we can't do that because we have to use _conf.get to
         # support the paste.ini options.
-        sess = session_loading.Session().load_from_options(
-            cert=self._conf.get('certfile'),
-            key=self._conf.get('keyfile'),
-            cacert=self._conf.get('cafile'),
-            insecure=self._conf.get('insecure'),
-            timeout=self._conf.get('http_connect_timeout'),
-            user_agent=self._conf.user_agent,
-        )
+        kwargs.setdefault('cert', self._conf.get('certfile'))
+        kwargs.setdefault('key', self._conf.get('keyfile'))
+        kwargs.setdefault('cacert', self._conf.get('cafile'))
+        kwargs.setdefault('insecure', self._conf.get('insecure'))
+        kwargs.setdefault('timeout', self._conf.get('http_connect_timeout'))
+        kwargs.setdefault('user_agent', self._conf.user_agent)
 
-        auth_plugin = self._get_auth_plugin()
+        return session_loading.Session().load_from_options(**kwargs)
 
+    def _create_identity_server(self):
         adap = adapter.Adapter(
-            sess,
-            auth=auth_plugin,
+            self._session,
+            auth=self._auth,
             service_type='identity',
             interface='internal',
             region_name=self._conf.get('region_name'),

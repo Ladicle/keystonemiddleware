@@ -24,10 +24,11 @@ class AuditApiLogicTest(base.BaseAuditMiddlewareTest):
     def get_payload(self, method, url,
                     audit_map=None, body=None, environ=None):
         audit_map = audit_map or self.audit_map
-        environ = environ or self.get_environ_header(method)
+        environ = environ or self.get_environ_header()
 
         req = webob.Request.blank(url,
                                   body=body,
+                                  method=method,
                                   environ=environ,
                                   remote_addr='192.168.0.1')
 
@@ -201,9 +202,10 @@ class AuditApiLogicTest(base.BaseAuditMiddlewareTest):
                                   environ=self.get_environ_header('GET'),
                                   remote_addr='192.168.0.1')
         req.context = {}
-        self.middleware._process_request(req)
+        middleware = self.create_simple_middleware()
+        middleware._process_request(req)
         payload = req.environ['cadf_event'].as_dict()
-        self.middleware._process_response(req, webob.Response())
+        middleware._process_response(req, webob.Response())
         payload2 = req.environ['cadf_event'].as_dict()
         self.assertEqual(payload['id'], payload2['id'])
         self.assertEqual(payload['tags'], payload2['tags'])
